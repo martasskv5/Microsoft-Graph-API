@@ -1,0 +1,6 @@
+Flask
+python-dotenv
+requests
+tkinter
+pyqt5
+msal
