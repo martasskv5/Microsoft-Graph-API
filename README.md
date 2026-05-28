@@ -38,6 +38,57 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
+## Run As Docker Container
+
+Use this when you want the Python Graph bridge running next to your .NET app.
+
+### Build and start
+
+```bash
+docker compose up -d --build
+```
+
+### Verify service is up
+
+```bash
+curl http://127.0.0.1:8787/health
+```
+
+### Stop service
+
+```bash
+docker compose down
+```
+
+### Notes for running with .NET
+
+- If your .NET app runs on the same host (outside Docker), call: `http://127.0.0.1:8787`
+- If your .NET app runs in Docker Compose too, call: `http://graph-api:8787` from that container.
+- Token cache is persisted in Docker volume `graph_api_data`, so auth state survives container restarts.
+- Secrets are loaded from `.env` via `env_file` in `docker-compose.yml`.
+
+### Authentication flow in Docker
+
+In containers, stdin/browser automation may not be available, so use redirect-based login:
+
+1. Start login and get `auth_uri`:
+
+```bash
+curl -X POST http://127.0.0.1:8787/auth/login/start \
+  -H "Content-Type: application/json" \
+  -d '{"user":"admin@0z6sw.onmicrosoft.com","scopes":["User.Read","Mail.Send"],"redirect_uri":"http://localhost:8787/auth/callback"}'
+```
+
+2. Open returned `auth_uri` in your browser and sign in.
+
+3. After successful sign-in, the callback endpoint stores token cache in the container volume.
+
+4. Verify authentication:
+
+```bash
+curl "http://127.0.0.1:8787/auth/status?user=admin@0z6sw.onmicrosoft.com"
+```
+
 ## Usage
 
 1. Ensure environment variables are set (or populated in a `.env` file):

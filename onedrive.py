@@ -51,13 +51,13 @@ class OneDrive:
             "Authorization": f"Bearer {self.access_token}",
             "Content-Type": "application/json"
         }
-        data = {
+        body = {
             "type": type, # view or edit
             "scope": scope, # anonymous or organization
             "expirationDateTime": expiration, # optional
             "password": password, # optional
         }
-        response = requests.post(url, headers=headers, data=json.dumps(data))
+        response = requests.post(url, headers=headers, data=json.dumps(body))
         response.raise_for_status()
         return response.json()["link"]["webUrl"]
     
@@ -67,4 +67,11 @@ def get_root_path(file_path):
     ### Parameters:
     - file_path (str): The file path to get the root path for.
     """
-    return file_path.replace("C:/Users/martinko/OneDrive - MSFT/", "")
+    normalized = file_path.replace("\\", "/")
+    markers = ["/OneDrive - MSFT/", "/OneDrive/"]
+
+    for marker in markers:
+        if marker in normalized:
+            return normalized.split(marker, 1)[1]
+
+    return normalized.lstrip("/")

@@ -3,14 +3,20 @@ import requests
 from ms_graph import get_access_token, MS_GRAPH_URL
 
 
-def send_email(sender_email: str, recipient_emails: str, subject: str, body: str, access_token: str | None = None) -> bool:
+def send_email(
+    sender_email: str,
+    recipient_emails: str | list[str],
+    subject: str,
+    body: str,
+    access_token: str | None = None,
+) -> bool:
     """
     Send an email using Microsoft Graph API.
 
     Args:
         access_token (str): Valid Microsoft Graph access token
         sender_email (str): Email address of the sender
-        recipient_emails (list[str]): List of recipient email addresses
+        recipient_emails (str | list[str]): Recipient email address(es)
         subject (str): Email subject
         body (str): Email body content
 
@@ -25,6 +31,12 @@ def send_email(sender_email: str, recipient_emails: str, subject: str, body: str
 
     endpoint = f'{MS_GRAPH_URL}/users/{sender_email}/sendMail'
 
+    recipients = (
+        recipient_emails
+        if isinstance(recipient_emails, list)
+        else [recipient_emails]
+    )
+
     email_data = {
         'message': {
             'subject': subject,
@@ -32,8 +44,7 @@ def send_email(sender_email: str, recipient_emails: str, subject: str, body: str
                 'contentType': 'HTML',
                 'content': body
             },
-            # [{'emailAddress': {'address': recipient}} for recipient in recipient_emails]
-            'toRecipients': [{"emailAddress": {"address": recipient_emails}}]
+            'toRecipients': [{'emailAddress': {'address': recipient}} for recipient in recipients]
         }
     }
 

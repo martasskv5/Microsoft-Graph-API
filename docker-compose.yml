@@ -1,0 +1,20 @@
+services:
+  graph-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: graph-api
+    ports:
+      - "8787:8787"
+    environment:
+      CLIENT_ID: "REPLACE_WITH_CLIENT_ID"
+      CLIENT_SECRET: "REPLACE_WITH_CLIENT_SECRET"
+      TENANT_ID: "REPLACE_WITH_TENANT_ID"
+      # Persist token cache in a mounted volume inside the container.
+      XDG_CACHE_HOME: /data/cache
+    volumes:
+      - graph_api_data:/data
+    restart: unless-stopped
+
+volumes:
+  graph_api_data:
