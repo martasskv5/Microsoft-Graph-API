@@ -6,6 +6,7 @@ Supports:
 - Legacy .excalidraw files (plain JSON)
 - Modern .excalidraw.md files (with compressed or uncompressed JSON)
 - Batch processing entire vaults
+- Embedded images (Pasted Images / attachments)
 
 Requirements:
     pip install playwright pyyaml lzstring
@@ -20,13 +21,14 @@ Usage:
 import argparse
 import base64
 import json
+import mimetypes
 import os
 import re
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 try:
     import yaml
@@ -39,14 +41,58 @@ except ImportError:
     sync_playwright = None
 
 
-def extract_excalidraw_json(file_path: Path) -> Optional[Dict]:
-    """Extract Excalidraw scene data from any supported file format."""
+def _extract_json_from_md_body(content: str) -> Optional[Tuple[Dict, str]]:
+    """Extract Excalidraw JSON from markdown body. Returns (scene_data, raw_md_content)."""
+    # Compressed JSON block
+    compressed_match = re.search(
+        r"```compressed-json\n(.*?)\n```",
+        content,
+        re.DOTALL
+    )
+    if compressed_match:
+        compressed_data = compressed_match.group(1).strip().replace("\n", "").replace("\r", "")
+        try:
+            from lzstring import LZString
+            decompressed = LZString.decompressFromBase64(compressed_data)
+            return json.loads(decompressed), content
+        except Exception:
+            pass
+
+    # Uncompressed JSON block
+    json_match = re.search(
+        r"```json\n(.*?)\n```",
+        content,
+        re.DOTALL
+    )
+    if json_match:
+        try:
+            return json.loads(json_match.group(1).strip()), content
+        except json.JSONDecodeError:
+            pass
+
+    # excalidraw-json code block
+    excalidraw_match = re.search(
+        r"```excalidraw-json\n(.*?)\n```",
+        content,
+        re.DOTALL
+    )
+    if excalidraw_match:
+        try:
+            return json.loads(excalidraw_match.group(1).strip()), content
+        except json.JSONDecodeError:
+            pass
+
+    return None, content
+
+
+def extract_excalidraw_json(file_path: Path) -> Optional[Tuple[Dict, str]]:
+    """Extract Excalidraw scene data and raw markdown from any supported file format."""
     content = file_path.read_text(encoding="utf-8", errors="ignore")
 
     # Legacy .excalidraw file (pure JSON)
     if file_path.suffix == ".excalidraw" or content.strip().startswith("{"):
         try:
-            return json.loads(content)
+            return json.loads(content), content
         except json.JSONDecodeError:
             pass
 
@@ -64,48 +110,148 @@ def extract_excalidraw_json(file_path: Path) -> Optional[Dict]:
     return _extract_json_from_md_body(content)
 
 
-def _extract_json_from_md_body(content: str) -> Optional[Dict]:
-    """Extract Excalidraw JSON from markdown body."""
-    # Compressed JSON block
-    compressed_match = re.search(
-        r"```compressed-json\n(.*?)\n```",
+def parse_embedded_files(content: str) -> Dict[str, str]:
+    """
+    Parse the ## Embedded Files section from Excalidraw markdown.
+    Returns dict mapping file_id -> wiki_link_path (e.g. [[Pasted Image ...]])
+    """
+    files = {}
+    # Match the Embedded Files section
+    embedded_match = re.search(
+        r"## Embedded Files\n(.*?)(?=\n## |\n%%|$)",
         content,
         re.DOTALL
     )
-    if compressed_match:
-        compressed_data = compressed_match.group(1).strip().replace("\n", "").replace("\r", "")
-        try:
-            import lzstring
-            decompressed = lzstring.LZString.decompressFromBase64(compressed_data)
-            return json.loads(decompressed)
-        except Exception:
-            pass
+    if not embedded_match:
+        return files
 
-    # Uncompressed JSON block
-    json_match = re.search(
-        r"```json\n(.*?)\n```",
-        content,
-        re.DOTALL
-    )
-    if json_match:
-        try:
-            return json.loads(json_match.group(1).strip())
-        except json.JSONDecodeError:
-            pass
+    section = embedded_match.group(1)
+    # Pattern: hash_id: [[wiki link]] or hash_id: filename
+    for line in section.strip().split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        # Match: id: [[filename]] or id: filename
+        match = re.match(r"^([a-f0-9]+):\s*\[\[(.*?)\]\]", line)
+        if match:
+            file_id, wiki_name = match.groups()
+            files[file_id] = wiki_name
+        else:
+            # Try without brackets
+            match = re.match(r"^([a-f0-9]+):\s*(.+)$", line)
+            if match:
+                file_id, filename = match.groups()
+                files[file_id] = filename.strip()
+    return files
 
-    # excalidraw-json code block
-    excalidraw_match = re.search(
-        r"```excalidraw-json\n(.*?)\n```",
-        content,
-        re.DOTALL
-    )
-    if excalidraw_match:
-        try:
-            return json.loads(excalidraw_match.group(1).strip())
-        except json.JSONDecodeError:
-            pass
+
+def resolve_wiki_link(vault_path: Path, drawing_path: Path, wiki_name: str) -> Optional[Path]:
+    """
+    Resolve an Obsidian wiki-link [[filename]] to an actual file path.
+    Searches in the same folder as the drawing, then vault root, then common attachment dirs.
+    """
+    # Remove any subpath prefix if present (e.g. "folder/file.png")
+    filename = Path(wiki_name).name
+
+    # Search locations in order of likelihood
+    search_roots = [
+        drawing_path.parent,  # Same folder as drawing
+        vault_path,           # Vault root
+        vault_path / "99 - Meta" / "02 - Attachments",  # User's specific vault structure
+        vault_path / "attachments",
+        vault_path / "Attachments",
+        vault_path / "assets",
+        vault_path / "Assets",
+        vault_path / "images",
+        vault_path / "Images",
+        vault_path / "img",
+    ]
+
+    for root in search_roots:
+        if not root.exists():
+            continue
+        # Direct match
+        candidate = root / filename
+        if candidate.exists():
+            return candidate
+        # Recursive search (for pasted images that might be in subfolders)
+        for found in root.rglob(filename):
+            if found.is_file():
+                return found
 
     return None
+
+
+def find_vault_root(start_path: Path) -> Path:
+    """
+    Walk up the directory tree looking for an .obsidian folder.
+    If found, that directory is the vault root.
+    Otherwise fall back to start_path.parent for single files.
+    """
+    current = start_path.resolve()
+    if current.is_file():
+        current = current.parent
+
+    while current != current.parent:  # Stop at filesystem root
+        obsidian_dir = current / ".obsidian"
+        if obsidian_dir.exists() and obsidian_dir.is_dir():
+            return current
+        current = current.parent
+
+    # Fallback: if no .obsidian found, return the parent of the input file
+    # or the input dir itself
+    if start_path.is_file():
+        return start_path.parent
+    return start_path
+
+
+def inject_embedded_files(
+    scene_data: Dict,
+    raw_content: str,
+    vault_path: Path,
+    drawing_path: Path
+) -> Dict:
+    """
+    Find embedded image references in the markdown, locate the actual files,
+    and inject them as base64 data URLs into the scene's `files` dictionary.
+    """
+    embedded = parse_embedded_files(raw_content)
+    if not embedded:
+        return scene_data
+
+    if "files" not in scene_data:
+        scene_data["files"] = {}
+
+    for file_id, wiki_name in embedded.items():
+        # Skip if already embedded in JSON
+        if file_id in scene_data.get("files", {}):
+            continue
+
+        img_path = resolve_wiki_link(vault_path, drawing_path, wiki_name)
+        if not img_path:
+            print(f"  Warning: Could not find embedded image: {wiki_name}")
+            continue
+
+        try:
+            mime, _ = mimetypes.guess_type(str(img_path))
+            if not mime:
+                mime = "image/png"
+
+            img_bytes = img_path.read_bytes()
+            b64_data = base64.b64encode(img_bytes).decode("utf-8")
+            data_url = f"data:{mime};base64,{b64_data}"
+
+            scene_data["files"][file_id] = {
+                "mimeType": mime,
+                "dataURL": data_url,
+                "id": file_id,
+                "created": os.path.getmtime(img_path),
+            }
+            print(f"  Embedded image resolved: {wiki_name} ({len(img_bytes)} bytes)")
+        except Exception as e:
+            print(f"  Warning: Failed to embed {wiki_name}: {e}")
+
+    return scene_data
 
 
 class ExcalidrawExporter:
@@ -132,6 +278,12 @@ class ExcalidrawExporter:
         self.transparent = transparent
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
+    @classmethod
+    def from_file(cls, file_path: Path, **kwargs):
+        """Create exporter from a single file, auto-detecting vault root."""
+        vault_root = find_vault_root(file_path)
+        return cls(vault_path=str(vault_root), **kwargs)
+
     def find_excalidraw_files(self) -> List[Path]:
         """Find all Excalidraw files in the vault."""
         files = []
@@ -147,15 +299,27 @@ class ExcalidrawExporter:
 
         return sorted(set(files))
 
+    def _prepare_scene(self, file_path: Path) -> Optional[Dict]:
+        """Extract and prepare scene data with embedded images."""
+        result = extract_excalidraw_json(file_path)
+        if not result or result[0] is None:
+            print(f"  Warning: Could not parse {file_path}")
+            return None
+
+        scene_data, raw_content = result
+        scene_data = inject_embedded_files(
+            scene_data, raw_content, self.vault_path, file_path
+        )
+        return scene_data
+
     def export_with_cli(
         self,
         file_path: Path,
         output_path: Optional[Path] = None
     ) -> Optional[Path]:
         """Export using excalidraw-brute-export-cli (most reliable)."""
-        scene_data = extract_excalidraw_json(file_path)
+        scene_data = self._prepare_scene(file_path)
         if not scene_data:
-            print(f"  Warning: Could not parse {file_path}")
             return None
 
         if output_path is None:
@@ -216,9 +380,8 @@ class ExcalidrawExporter:
             print("  Playwright not installed. Use: pip install playwright")
             return None
 
-        scene_data = extract_excalidraw_json(file_path)
+        scene_data = self._prepare_scene(file_path)
         if not scene_data:
-            print(f"  Warning: Could not parse {file_path}")
             return None
 
         if output_path is None:
@@ -347,6 +510,10 @@ def main():
         help="Transparent background"
     )
     parser.add_argument(
+        "--vault",
+        help="Explicit vault root path (auto-detected from .obsidian folder if omitted)"
+    )
+    parser.add_argument(
         "--playwright",
         action="store_true",
         help="Use Playwright instead of CLI tool"
@@ -361,10 +528,16 @@ def main():
         sys.exit(1)
 
     try:
+        if args.vault:
+            vault_root = Path(args.vault).resolve()
+        elif input_path.is_dir():
+            vault_root = input_path
+        else:
+            vault_root = find_vault_root(input_path)
+            print(f"Auto-detected vault root: {vault_root}")
+
         exporter = ExcalidrawExporter(
-            vault_path=str(
-                input_path if input_path.is_dir() else input_path.parent
-            ),
+            vault_path=str(vault_root),
             output_dir=args.output,
             scale=args.scale,
             padding=args.padding,

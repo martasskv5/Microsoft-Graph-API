@@ -66,17 +66,18 @@ DEFAULT_CLIENT_SECRET = os.getenv("O2S_SECRET", "").strip()
 # The alias is the last part of /sites/spsitknm-2025-2026-<alias>
 SUBJECT_MAP = {
     "00 - ANJ":       {"sp_name": "ANJ",       "alias": "anj"},
-    "01 - Appslab":   {"sp_name": "Appslab",   "alias": "appslab"},
-    "02 - CIT":       {"sp_name": "CIT",       "alias": "cit"},
-    "03 - CSX":       {"sp_name": "CSX",       "alias": "csx"},
-    "04 - DAA":       {"sp_name": "DAA",       "alias": "daa"},
-    "05 - ELE":       {"sp_name": "ELE",       "alias": "ele"},
-    "06 - MAT":       {"sp_name": "MAT",       "alias": "mat"},
-    "07 - OBN":       {"sp_name": "OBN",       "alias": "obn"},
-    "08 - PAY":       {"sp_name": "PAY",       "alias": "pay"},
-    "09 - PRO":       {"sp_name": "PRO",       "alias": "pro"},
-    "10 - SJL - ESI": {"sp_name": "SJL",       "alias": "sjl"},
+    "01 - APM":       {"sp_name": "APM",       "alias": "apm"},
+    "02 - Appslab":   {"sp_name": "Appslab",   "alias": "appslab"},
+    "03 - CEQ":       {"sp_name": "CEQ",       "alias": "ceq"},
+    "04 - CIT":       {"sp_name": "CIT",       "alias": "cit"},
+    "05 - CME":       {"sp_name": "CME",       "alias": "cme"},
+    "06 - CSX":       {"sp_name": "CSX",       "alias": "csx"},
+    "07 - EKO":       {"sp_name": "EKO",       "alias": "eko"},
+    "08 - ETS":       {"sp_name": "ETS",       "alias": "ets"},
+    "09 - MAT":       {"sp_name": "MAT",       "alias": "mat"},
+    "10 - SJL": {"sp_name": "SJL",       "alias": "sjl"},
     "11 - SXT":       {"sp_name": "SXT",       "alias": "sxt"},
+    "12 - USP":       {"sp_name": "USP",       "alias": "usp"},
 }
 
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
@@ -123,13 +124,13 @@ def default_page_name(title: str) -> str:
     return page_name
 
 
-def parse_date_string(value: object) -> dt.date | None:
-    """Parse a date-like frontmatter or string value into a date."""
+def parse_date_string(value: object) -> dt.datetime | dt.date | None:
+    """Parse a date-like frontmatter or string value into a date or datetime."""
     if value is None:
         return None
 
     if isinstance(value, dt.datetime):
-        return value.date()
+        return value
     if isinstance(value, dt.date):
         return value
 
@@ -137,6 +138,26 @@ def parse_date_string(value: object) -> dt.date | None:
     if not text:
         return None
 
+    # Try datetime patterns first (date + time, e.g. 2026-06-03 16-14 or 2026-06-03T16:14)
+    dt_patterns = [
+        r"(?P<year>\d{4})-(?P<month>\d{2})-(?P<day>\d{2})[ T](?P<hour>\d{2})[-:](?P<minute>\d{2})[-:]?(?P<second>\d{2})?",
+        r"(?P<year>\d{4})/(?P<month>\d{2})/(?P<day>\d{2})[ T](?P<hour>\d{2})[-:](?P<minute>\d{2})[-:]?(?P<second>\d{2})?",
+    ]
+    for pattern in dt_patterns:
+        match = re.search(pattern, text)
+        if match:
+            try:
+                year = int(match.group("year"))
+                month = int(match.group("month"))
+                day = int(match.group("day"))
+                hour = int(match.group("hour"))
+                minute = int(match.group("minute"))
+                second = int(match.group("second") or 0)
+                return dt.datetime(year, month, day, hour, minute, second)
+            except ValueError:
+                continue
+
+    # Fall back to date-only patterns
     for pattern in (
         r"(?P<year>\d{4})-(?P<month>\d{2})-(?P<day>\d{2})",
         r"(?P<year>\d{4})/(?P<month>\d{2})/(?P<day>\d{2})",
@@ -154,7 +175,7 @@ def parse_date_string(value: object) -> dt.date | None:
         return None
 
 
-def extract_note_date(frontmatter: dict, title: str) -> dt.date | None:
+def extract_note_date(frontmatter: dict, title: str) -> dt.datetime | dt.date | None:
     """Find the best date for a note using filename and frontmatter."""
     title_date = parse_date_string(title)
     if title_date:
@@ -168,7 +189,7 @@ def extract_note_date(frontmatter: dict, title: str) -> dt.date | None:
     return None
 
 
-def extract_page_date(page: dict) -> dt.date | None:
+def extract_page_date(page: dict) -> dt.datetime | dt.date | None:
     """Extract a page date from Graph metadata for sorting."""
     description_date = parse_date_string(page.get("description"))
     if description_date:
@@ -187,6 +208,9 @@ def page_sort_key(page: dict) -> tuple:
     title = (page.get("title") or page.get("name") or "").lower()
     if not page_date:
         return (0, 0, title)
+    # Use timestamp for datetime (includes time), toordinal for plain date
+    if isinstance(page_date, dt.datetime):
+        return (1, -page_date.timestamp(), title)
     return (1, -page_date.toordinal(), title)
 
 
@@ -373,12 +397,19 @@ def render_excalidraw_to_png(excalidraw_path: Path, output_path: Path) -> Path:
     try:
         import excalidraw_to_png as exporter_module
         ExcalidrawExporter = exporter_module.ExcalidrawExporter
+        find_vault_root_exp = getattr(exporter_module, "find_vault_root", None)
         has_playwright = getattr(exporter_module, "sync_playwright", None) is not None
     except Exception as exc:
         raise RuntimeError(f"Excalidraw exporter not available: {exc}")
 
+    # Detect vault root properly — not just the Excalidraw file's parent folder
+    if find_vault_root_exp:
+        vault_root = find_vault_root_exp(excalidraw_path)
+    else:
+        vault_root = find_vault_root(str(excalidraw_path)) or excalidraw_path.parent
+
     exporter = ExcalidrawExporter(
-        vault_path=str(excalidraw_path.parent),
+        vault_path=str(vault_root),
         output_dir=str(output_path.parent),
     )
 
@@ -452,6 +483,7 @@ def find_obsidian_asset_path(note_path: str, target: str) -> Path | None:
         if vault_root:
             candidates.append(vault_root / direct)
             candidates.append(vault_root / "_img" / direct.name)
+            candidates.append(vault_root / "99 - Meta" / "02 - Attachments" / direct.name)
             candidates.append(vault_root / EXCALIDRAW_FOLDER / f"{direct.name}.md")
             candidates.append(vault_root / EXCALIDRAW_FOLDER / f"{direct.name}.excalidraw.md")
 
@@ -699,22 +731,35 @@ def export_dry_run_page(
 
 def clean_obsidian_footer(md_content: str) -> str:
     """Remove Obsidian footer artifacts that should not reach SharePoint."""
-    cleaned_lines = []
-    for line in md_content.splitlines():
-        stripped = line.strip()
-        if not stripped:
-            cleaned_lines.append(line)
-            continue
+    nav_line_pattern = re.compile(r"^(Predchádzajúca|Nasledujúca|Ďalšia)\s*:\s*\[\[[^\]]+\]\]\s*$")
+    lines = md_content.splitlines()
+
+    # Remove trailing footer blocks from the end of the note.
+    while lines and not lines[-1].strip():
+        lines.pop()
+
+    removed_footer_content = False
+    while lines:
+        stripped = lines[-1].strip()
 
         if stripped == "undefined":
+            lines.pop()
+            removed_footer_content = True
             continue
 
-        if re.match(r"^(Predchádzajúca|Nasledujúca)\s*:\s*\[\[[^\]]+\]\]\s*$", stripped):
+        if nav_line_pattern.match(stripped):
+            lines.pop()
+            removed_footer_content = True
             continue
 
-        cleaned_lines.append(line)
+        if stripped == "---" and removed_footer_content:
+            lines.pop()
+            removed_footer_content = True
+            continue
 
-    cleaned = "\n".join(cleaned_lines).strip()
+        break
+
+    cleaned = "\n".join(lines).strip()
     cleaned = re.sub(r"(?:\n\s*){3,}$", "\n\n", cleaned)
     return cleaned
 
@@ -835,7 +880,11 @@ def create_page(
     resp = requests.post(url, headers=headers, json=payload)
 
     if resp.status_code == 409:
-        raise RuntimeError(f"A page named '{page_name}' already exists in this site.")
+        print(f"⚠️  Page '{page_name}' already exists. Updating instead...")
+        existing_page = get_page_by_name(site_id, page_name, token)
+        if existing_page:
+            return update_page(site_id, existing_page["id"], title, html_content, token, description=description)
+        raise RuntimeError(f"A page named '{page_name}' already exists but could not be found for update.")
     if resp.status_code in (401, 403):
         raise RuntimeError(
             "Microsoft Graph rejected the page creation request with an authorization error. "
@@ -853,8 +902,10 @@ def create_page(
 
 def get_page_by_name(site_id: str, page_name: str, token: str):
     """Look up a SharePoint page by file name."""
-    url = f"{GRAPH_BASE}/sites/{site_id}/pages/microsoft.graph.sitePage"
     headers = {"Authorization": f"Bearer {token}", "Accept": "application/json;odata.metadata=none"}
+
+    # Try 1: Filter query on the pages endpoint
+    url = f"{GRAPH_BASE}/sites/{site_id}/pages/microsoft.graph.sitePage"
     escaped_page_name = page_name.replace("'", "''")
     params = {"$filter": f"name eq '{escaped_page_name}'", "$top": 1}
     resp = requests.get(url, headers=headers, params=params)
@@ -867,7 +918,21 @@ def get_page_by_name(site_id: str, page_name: str, token: str):
     resp.raise_for_status()
 
     results = resp.json().get("value", [])
-    return results[0] if results else None
+    if results:
+        return results[0]
+
+    # Try 2: Fallback — list all pages and match manually (filter sometimes misses existing pages)
+    all_pages = list_site_pages(site_id, token)
+    page_name_lower = page_name.lower()
+    for page in all_pages:
+        if (page.get("name") or "").lower() == page_name_lower:
+            return page
+        # Also match by title-derived name in case the stored name differs
+        title_name = default_page_name(page.get("title") or "").lower()
+        if title_name == page_name_lower:
+            return page
+
+    return None
 
 
 def list_site_pages(site_id: str, token: str) -> list[dict]:
@@ -918,7 +983,12 @@ def build_index_page_html(pages: list[dict]) -> str:
         sections.append("<ul>")
         for page in dated:
             page_date = extract_page_date(page)
-            date_label = page_date.isoformat() if page_date else ""
+            if isinstance(page_date, dt.datetime):
+                date_label = page_date.strftime("%Y-%m-%d %H:%M")
+            elif isinstance(page_date, dt.date):
+                date_label = page_date.isoformat()
+            else:
+                date_label = ""
             title = html.escape(page.get("title") or page.get("name") or "Untitled")
             url = html.escape(page.get("webUrl") or "#", quote=True)
             prefix = f"<strong>{date_label}</strong> — " if date_label else ""

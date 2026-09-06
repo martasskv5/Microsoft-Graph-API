@@ -5,9 +5,9 @@ $TenantName     = "0z6sw"                          # e.g. contoso
 $AdminUrl       = "https://$TenantName-admin.sharepoint.com"
 $SchoolTitle    = "SPSITKNM"
 $SchoolUrl      = "https://$TenantName.sharepoint.com/sites/$($SchoolTitle.ToLower())"
-$YearTitle      = "2025-2026"
+$YearTitle      = "2026-2027"
 $YearUrl        = "https://$TenantName.sharepoint.com/sites/$($SchoolTitle.ToLower())-$($YearTitle.Replace('.','-'))"
-$Subjects       = @("ANJ", "Appslab", "CIT", "CSX", "DAA", "ELE", "MAT", "OBN", "PAY", "PRO", "SJL", "SXT")
+$Subjects       = @("ANJ", "APM", "Appslab", "CEQ", "CIT", "CME", "CSX", "EKO", "ETS", "MAT", "SJL", "SXT", "USP")
 $OwnerEmail     = "admin@$TenantName.onmicrosoft.com"   # Site collection admin
 
 # ============================================================
@@ -46,6 +46,8 @@ $YearSite = New-PnPSite `
     -Url $YearUrl `
     -Owner $OwnerEmail `
     -SiteDesign Topic
+
+Set-PnPSite -Identity $YearUrl -NoScriptSite $false # Allow custom scripts for the year site
 
 Write-Host "   Site created at: $YearSite" -ForegroundColor Green
 
