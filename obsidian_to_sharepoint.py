@@ -3,52 +3,32 @@
 obsidian_to_sharepoint.py
 Push the current Obsidian note to the correct SharePoint subject site.
 
-Auto-detects:
-  - Subject from parent folder name (e.g. "02 - CIT" -> CIT site)
-  - School year from vault folder name (e.g. "SPSITknm 25-26" -> 2025-2026)
-
-Usage:
-    python obsidian_to_sharepoint.py --file "{{file_path:absolute}}"
-
-Obsidian Shell Commands plugin:
-    python C:\\path\\to\\obsidian_to_sharepoint.py --file "{{file_path:absolute}}"
-
 Requirements:
-    pip install requests msal markdown pyyaml
-    System: latex + dvipng on PATH (Arch: texlive-basic texlive-latex
-            texlive-latexrecommended texlive-latexextra texlive-bin)
-
-Auth overrides:
-    --client-id, --client-secret, --tenant-id, --scopes
+    pip install requests msal markdown pyyaml ziamath
 """
 
 import argparse
-import base64
 import datetime as dt
 import hashlib
-import io
 import html
-import math
 import os
 import re
 import json
 import sys
 import shutil
-import subprocess
 import tempfile
-import textwrap
 import time
 from pathlib import Path
-from urllib.parse import quote, unquote
+from urllib.parse import quote
 
 try:
     import requests
     import markdown
     import yaml
-    from PIL import Image, ImageDraw, ImageFont
+    import ziamath as zm
 except ImportError as e:
     print(f"Missing dependency: {e.name}")
-    print("Install: pip install requests msal markdown pyyaml pillow")
+    print("Install: pip install requests msal markdown pyyaml ziamath")
     sys.exit(1)
 
 try:
@@ -87,37 +67,9 @@ SUBJECT_MAP = {
 
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 TOKEN_CACHE = os.path.join(Path.home(), ".obsidian_sp_cache.bin")
-IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tif", ".tiff"}
 EXCALIDRAW_FOLDER = Path("99 - Meta") / "Excalidraw"
 INDEX_PAGE_TITLE = os.getenv("O2S_INDEX_PAGE", "Index")
 INDEX_PAGE_DESCRIPTION = "Auto-generated page index"
-FONT_CANDIDATES = (
-    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-    "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
-    "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
-)
-
-
-# ============================================================
-# LaTeX TOOLCHAIN DETECTION
-# ============================================================
-
-def _detect_latex_toolchain() -> tuple:
-    """Return (available, reason). Checks latex and dvipng on PATH."""
-    for tool in ("latex", "dvipng"):
-        try:
-            subprocess.run(
-                [tool, "--version"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                check=True,
-            )
-        except (FileNotFoundError, subprocess.CalledProcessError):
-            return False, f"{tool} not found on PATH"
-    return True, "ok"
-
-
-_HAS_LATEX, _LATEX_REASON = _detect_latex_toolchain()
 
 
 # ============================================================
@@ -125,7 +77,6 @@ _HAS_LATEX, _LATEX_REASON = _detect_latex_toolchain()
 # ============================================================
 
 def parse_frontmatter(content: str):
-    """Extract YAML frontmatter and body from markdown."""
     if content.startswith("---"):
         parts = content.split("---", 2)
         if len(parts) >= 3:
@@ -138,13 +89,11 @@ def parse_frontmatter(content: str):
 
 
 def md_to_html(md_content: str) -> str:
-    """Convert markdown to HTML with fenced code, table, and newline support."""
     md = markdown.Markdown(extensions=["fenced_code", "tables", "nl2br", "md_in_html"])
     return md.convert(md_content)
 
 
 def default_page_name(title: str) -> str:
-    """Build the default SharePoint page file name from a title."""
     page_name = re.sub(r"[^\w\-]", "-", title).lower()
     if not page_name.endswith(".aspx"):
         page_name += ".aspx"
@@ -152,7 +101,6 @@ def default_page_name(title: str) -> str:
 
 
 def parse_date_string(value: object):
-    """Parse a date-like frontmatter or string value into a date or datetime."""
     if value is None:
         return None
     if isinstance(value, dt.datetime):
@@ -246,15 +194,8 @@ def normalize_input_file_path(raw_path: str) -> Path:
     return Path(candidate)
 
 
-def load_font(size: int):
-    for candidate in FONT_CANDIDATES:
-        if os.path.exists(candidate):
-            return ImageFont.truetype(candidate, size=size)
-    return ImageFont.load_default()
-
-
 # ------------------------------------------------------------
-# Excalidraw / Obsidian asset resolution (unchanged)
+# Excalidraw / Obsidian asset resolution
 # ------------------------------------------------------------
 
 def _lz_get_base_value(char: str) -> int:
@@ -618,121 +559,19 @@ def replace_obsidian_embeds_local(
 
 
 # ============================================================
-# LaTeX rendering via latex + dvipng -> PNG
+# LaTeX -> SVG File (Uploaded to SharePoint)
 # ============================================================
 
-_LATEX_DOCUMENT_TEMPLATE = r"""\documentclass[border=2pt]{standalone}
-\usepackage{amsmath}
-\usepackage{amssymb}
-\usepackage{amsfonts}
-\usepackage{varwidth}
-\begin{document}
-%(body)s
-\end{document}
-"""
-
-
-def _run_latex_toolchain(
-    latex_source: str,
-    workdir: Path,
-    timeout: int = 30,
-    dpi: int = 300,
-) -> Path:
-    """
-    Compile a LaTeX snippet with latex + dvipng.
-    Returns the path to the produced .png file.
-    Raises RuntimeError on any failure.
-    """
-    tex_file = workdir / "formula.tex"
-    dvi_file = workdir / "formula.dvi"
-    png_file = workdir / "formula.png"
-
-    tex_file.write_text(latex_source, encoding="utf-8")
-
+def _render_latex_to_svg_file(expr: str, output_path: Path) -> bool:
+    """Render a LaTeX expression to an SVG file using ziamath."""
     try:
-        latex_proc = subprocess.run(
-            [
-                "latex",
-                "-interaction=nonstopmode",
-                "-halt-on-error",
-                "-output-directory", str(workdir),
-                str(tex_file),
-            ],
-            cwd=str(workdir),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            timeout=timeout,
-        )
-    except subprocess.TimeoutExpired:
-        raise RuntimeError("latex timed out")
-
-    if latex_proc.returncode != 0 or not dvi_file.exists():
-        log_tail = latex_proc.stdout.decode("utf-8", errors="replace")[-1500:]
-        raise RuntimeError(f"latex failed:\n{log_tail}")
-
-    try:
-        dvipng_proc = subprocess.run(
-            [
-                "dvipng",
-                "-D", str(dpi),
-                "-T", "tight",
-                "-bg", "Transparent",
-                "-o", str(png_file),
-                str(dvi_file),
-            ],
-            cwd=str(workdir),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            timeout=timeout,
-        )
-    except subprocess.TimeoutExpired:
-        raise RuntimeError("dvipng timed out")
-
-    if dvipng_proc.returncode != 0 or not png_file.exists():
-        log_tail = dvipng_proc.stdout.decode("utf-8", errors="replace")[-1500:]
-        raise RuntimeError(f"dvipng failed:\n{log_tail}")
-
-    return png_file
-
-
-def _render_latex_to_png_file(
-    latex_expr: str,
-    display_mode: bool,
-    output_path: Path,
-) -> bool:
-    """
-    Render a LaTeX expression to a PNG file at output_path.
-    Returns True on success, False on failure.
-    """
-    if not _HAS_LATEX:
+        latex_obj = zm.Latex(expr, size=16)
+        svg_str = latex_obj.svg()
+        output_path.write_text(svg_str, encoding="utf-8")
+        return True
+    except Exception as exc:
+        print(f"      \u26a0\ufe0f  SVG conversion failed for: {expr[:60]}... ({exc})")
         return False
-
-    expr = latex_expr.strip()
-    if not expr:
-        return False
-
-    expr = re.sub(r"^\$\$|\$\$$", "", expr).strip()
-
-    if display_mode:
-        body = f"$\\displaystyle {expr}$"
-        dpi = 300
-    else:
-        body = f"${expr}$"
-        dpi = 240  # smaller raster so inline math matches body text height
-
-    source = _LATEX_DOCUMENT_TEMPLATE % {"body": body}
-
-    with tempfile.TemporaryDirectory(prefix="o2s_latex_") as tmp:
-        workdir = Path(tmp)
-        try:
-            produced_png = _run_latex_toolchain(source, workdir, dpi=dpi)
-        except RuntimeError as exc:
-            print(f"      \u26a0\ufe0f  LaTeX render failed for: {expr[:60]}... ({exc})")
-            return False
-
-        shutil.copy2(produced_png, output_path)
-
-    return True
 
 
 def replace_latex_expressions(
@@ -742,14 +581,9 @@ def replace_latex_expressions(
     cache: dict,
 ) -> str:
     """
-    Replace $...$ and $$...$$ with rendered PNG images.
+    Replace $...$ and $$...$$ with rendered SVG images uploaded via store_func.
     store_func(tmp_path, asset_name) -> public URL string
     """
-    if not _HAS_LATEX:
-        print(f"\u26a0\ufe0f  LaTeX toolchain unavailable ({_LATEX_REASON}); "
-              f"leaving raw $...$ math in place.")
-        return md_content
-
     def render(latex_expr: str, display_mode: bool):
         expr_clean = latex_expr.strip()
         if not expr_clean:
@@ -759,11 +593,11 @@ def replace_latex_expressions(
         if expr_key in cache:
             return cache[expr_key]
 
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".svg") as tmp:
             tmp_path = Path(tmp.name)
 
         try:
-            ok = _render_latex_to_png_file(expr_clean, display_mode, tmp_path)
+            ok = _render_latex_to_svg_file(expr_clean, tmp_path)
             if not ok:
                 return None
             asset_name = build_remote_asset_name(page_name, expr_key, tmp_path, "latex")
@@ -791,8 +625,7 @@ def replace_latex_expressions(
         def replace_display(m: re.Match) -> str:
             url = render(m.group(1), True)
             if url:
-                # Removed \n\n so it doesn't break out of lists
-                return f'<img src="{html.escape(url, quote=True)}" alt="math" style="display:block;margin:16px auto;max-width:100%;" />'
+                return f'<div style="text-align:center;margin:16px 0;"><img src="{html.escape(url, quote=True)}" alt="math" style="max-width:100%;" /></div>'
             return m.group(0)
 
         part = re.sub(r"\$\$(.+?)\$\$", replace_display, part, flags=re.DOTALL)
@@ -804,11 +637,7 @@ def replace_latex_expressions(
                 return m.group(0)
             url = render(expr, False)
             if url:
-                return (
-                    f'<img src="{html.escape(url, quote=True)}" alt="math" '
-                    'style="display:inline-block;vertical-align:-0.25em;'
-                    'height:1em;width:auto;" />'
-                )
+                return f'<img src="{html.escape(url, quote=True)}" alt="math" style="display:inline-block;vertical-align:middle;max-height:2.5em;width:auto;" />'
             return m.group(0)
 
         part = re.sub(r"(?<!\$)\$(?!\$)([^$\n]+?)\$(?!\$)", replace_inline, part)
@@ -1001,20 +830,11 @@ _CALLOUT_RE = re.compile(
 
 
 def convert_obsidian_callouts(md_content: str) -> str:
-    """
-    Convert Obsidian callouts of the form:
-        > [!note] Title
-        > body line 1
-        > body line 2
-    into styled <div> blocks. The body is rendered as Markdown first so
-    lists, bold, links, and inline code inside callouts work correctly.
-    """
     def repl(match: re.Match) -> str:
         kind = match.group("kind").lower()
         title = match.group("title").strip()
         body_raw = match.group("body") or ""
 
-        # Strip the leading '>' from every body line.
         body_lines = []
         for line in body_raw.splitlines():
             if line.startswith(">"):
@@ -1031,18 +851,12 @@ def convert_obsidian_callouts(md_content: str) -> str:
             kind, ("\U0001F4CC", "#555555", "#f5f5f5")
         )
 
-        # Ensure the first line after the title is treated as the start
-        # of a block, so lists become <ol>/<ul> instead of plain text.
         if body_md.strip():
             body_md = "\n" + body_md
-        
-        # Recursively convert nested callouts first.
-        body_md = convert_obsidian_callouts(body_md)
 
-        # NEW: Fix lists/code blocks inside the callout
+        body_md = convert_obsidian_callouts(body_md)
         body_md = fix_markdown_formatting(body_md)
 
-        # Render the body as HTML *now*, so lists/bold/code work.
         body_html = md_to_html(body_md) if body_md.strip() else ""
 
         title_html = (
@@ -1161,49 +975,42 @@ def clean_obsidian_footer(md_content: str) -> str:
 
 
 def fix_markdown_formatting(md_content: str) -> str:
-    """
-    Fixes Markdown formatting issues where lists and code blocks are 
-    not separated by blank lines (which Python Markdown requires).
-    """
     lines = md_content.split('\n')
     out_lines = []
     in_code_block = False
-    
+
     for line in lines:
         stripped = line.strip()
-        
-        # Handle code blocks (```)
+
         if stripped.startswith('```') or stripped.startswith('~~~'):
             in_code_block = not in_code_block
-            if not in_code_block: # closing tag
+            if not in_code_block:
                 out_lines.append(line)
-                out_lines.append('') # ensure blank line after code block
-            else: # opening tag
+                out_lines.append('')
+            else:
                 if out_lines and out_lines[-1].strip() != '':
                     out_lines.append('')
                 out_lines.append(line)
             continue
-            
+
         if in_code_block:
             out_lines.append(line)
             continue
-            
-        # Handle lists (e.g., "- ", "* ", "1. ")
+
         if re.match(r'^[ \t]*(?:[-*+]|\d+\.)\s+', line):
             if out_lines and out_lines[-1].strip() != '':
                 if not re.match(r'^[ \t]*(?:[-*+]|\d+\.)\s+', out_lines[-1]):
                     if not re.match(r'^[ \t]+', out_lines[-1]):
                         out_lines.append('')
-                        
+
         out_lines.append(line)
-        
-    # Clean up multiple consecutive blank lines
+
     cleaned = []
     for line in out_lines:
         if line.strip() == '' and cleaned and cleaned[-1].strip() == '':
             continue
         cleaned.append(line)
-        
+
     return '\n'.join(cleaned)
 
 
@@ -1426,11 +1233,10 @@ def refresh_navigation_index(site_id: str, token: str, current_page=None):
     else:
         updated_page = create_page(site_id, index_title, index_html, token, index_page_name, description=INDEX_PAGE_DESCRIPTION)
 
-    # NEW: Publish the index page so it becomes visible to readers
     index_page_id = updated_page.get("id")
     if index_page_id:
         publish_page(site_id, index_page_id, token)
-        
+
     return updated_page
 
 
@@ -1575,10 +1381,7 @@ def main():
 
     page_name = args.page_name if args.page_name else default_page_name(title)
     body = clean_obsidian_footer(body)
-    
-    # Insert blank lines before lists/code blocks
     body = fix_markdown_formatting(body)
-    
     body = convert_obsidian_callouts(body)
 
     note_date = extract_note_date(frontmatter, title)
