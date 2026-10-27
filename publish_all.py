@@ -26,10 +26,10 @@ except ImportError:
 # --- CONFIGURATION ---
 CONTENT_REPO_DIR = Path("/home/martinko/Projects/spsknm-notes").resolve()
 
-# Base config - fixed TOML syntax for Mermaid inside the array
 BASE_ZENSICAL_CONFIG = """\
 [project]
 site_name = "SPSITKNM Notes"
+copyright = "Copyright &copy; 2026 Martin Michalec"
 use_directory_urls = false
 extra_javascript = [
     "javascripts/mathjax.js",
@@ -44,16 +44,42 @@ markdown_extensions = [
     { "pymdownx.arithmatex" = { generic = true } },
     { "pymdownx.superfences" = { custom_fences = [
         { name = "mermaid", class = "mermaid", format = "pymdownx.superfences.fence_code_format" }
-    ] } }
+    ] } },
+    { "toc" = { toc_depth = "2-6" } }
 ]
+
+# NAV_PLACEHOLDER
 
 [project.theme]
 name = "material"
+language = "sk"
 features = [
+    "navigation.footer",
     "navigation.tabs",
     "navigation.sections",
     "content.code.copy"
 ]
+
+[[project.theme.palette]]
+media = "(prefers-color-scheme)"
+toggle.icon = "lucide/sun-moon"
+toggle.name = "Switch to light mode"
+
+[[project.theme.palette]]
+media = "(prefers-color-scheme: light)"
+scheme = "default"
+toggle.icon = "lucide/sun"
+toggle.name = "Switch to dark mode"
+
+[[project.theme.palette]]
+media = "(prefers-color-scheme: dark)"
+scheme = "slate"
+toggle.icon = "lucide/moon"
+toggle.name = "Switch to system preference"
+
+[[project.extra.social]]
+icon = "fontawesome/brands/github"
+link = "https://github.com/martasskv5"
 """
 
 DEFAULT_MATHJAX_JS = r"""window.MathJax = {
@@ -114,6 +140,20 @@ def find_asset_path(vault_root: Path, note_dir: Path, target: str):
         if c.is_file():
             return c
     return None
+
+def fix_header_hierarchy(md_content: str) -> str:
+    lines = md_content.split('\n')
+    h1_count = 0
+    out_lines = []
+    
+    for line in lines:
+        if line.startswith('# ') and not line.startswith('## '):
+            h1_count += 1
+            if h1_count > 1:
+                line = '## ' + line[2:]
+        out_lines.append(line)
+        
+    return '\n'.join(out_lines)
 
 def convert_obsidian_callouts(md_content: str) -> str:
     callout_re = re.compile(r"^>\s*\[!([^\]]+)\][+-]?\s*(.*?)\n((?:^>.*(?:\n|$))*)", re.MULTILINE)
@@ -185,6 +225,8 @@ def fix_markdown_formatting(md_content: str) -> str:
     return '\n'.join(cleaned)
 
 def preprocess_math(md):
+    md = re.sub(r'\\(xrightarrow|xleftarrow)\{([^{}]*\\\\[^{}]*)\}', r'\\\1{\\substack{\2}}', md)
+
     code_blocks = []
     def save_code(m):
         code_blocks.append(m.group(0))
@@ -238,7 +280,7 @@ def generate_subject_index(subject_dir: Path, subject_alias: str):
         title, date = extract_metadata(p)
         notes.append((date, title, p.name))
         
-    notes.sort(key=lambda x: natural_sort_key(x[2]))
+    notes.sort(key=lambda x: natural_sort_key(x[1]))
     
     lines = [f"# {subject_alias}\n", "Zoznam poznámok:\n"]
     
@@ -290,34 +332,48 @@ def generate_main_index(docs_dir: Path):
     
     (docs_dir / "index.md").write_text("".join(html_out), encoding="utf-8")
 
-def regenerate_config(config_path: Path, docs_dir: Path):
-    """Forces a clean generation of zensical.toml to fix any manual edits or bugs."""
+def regenerate_config(config_path: Path, docs_dir: Path, run_order: dict):
     nav_items = []
     for subject_dir in sorted(docs_dir.iterdir(), key=lambda p: p.name):
         if subject_dir.is_dir() and subject_dir.name not in ("javascripts",):
             subject_alias = subject_dir.name
-            files = []
-            for p in subject_dir.glob("*.md"):
-                if p.name != "index.md":
-                    files.append(p.name)
+            files = list(subject_dir.glob("*.md"))
             
-            files.sort(key=natural_sort_key)
+            # Prioritize files based on the command-line order
+            ordered_files = []
+            for fname in run_order.get(subject_alias, []):
+                fpath = subject_dir / fname
+                if fpath in files:
+                    ordered_files.append(fpath)
             
-            sub_nav_files = [f'"{subject_alias}/index.md"']
-            for filename in files:
-                sub_nav_files.append(f'"{subject_alias}/{filename}"')
+            rest_files = [f for f in files if f not in ordered_files]
+            rest_files.sort(key=lambda p: natural_sort_key(extract_metadata(p)[0]))
+            
+            final_files = ordered_files + rest_files
+            
+            sub_nav = []
+            for p in final_files:
+                if p.name == "index.md":
+                    continue
+                title, _ = extract_metadata(p)
+                title_clean = title.replace('"', '\\"')
+                sub_nav.append(f'{{ "{title_clean}" = "{subject_alias}/{p.name}" }}')
                 
-            files_str = ",\n                ".join(sub_nav_files)
-            nav_items.append(f'    {{ "{subject_alias}" = [\n                {files_str}\n            ] }}')
+            sub_nav.insert(0, f'{{ "Index" = "{subject_alias}/index.md" }}')
+                
+            if sub_nav:
+                files_str = ",\n                ".join(sub_nav)
+                nav_items.append(f'    {{ "{subject_alias}" = [\n                {files_str}\n            ] }}')
 
     nav_str = ",\n".join(nav_items)
-    full_content = BASE_ZENSICAL_CONFIG + f"\nnav = [\n{nav_str}\n]\n" if nav_items else BASE_ZENSICAL_CONFIG
-    
+    nav_block = f"nav = [\n{nav_str}\n]" if nav_items else ""
+
+    full_content = BASE_ZENSICAL_CONFIG.replace("# NAV_PLACEHOLDER", nav_block)
     config_path.write_text(full_content, encoding="utf-8")
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--file", "-f", required=True, nargs="+", help="Paths to markdown files or directories")
+    parser.add_argument("--file", "-f", required=True, nargs="+", action="extend", help="Paths to markdown files or directories")
     parser.add_argument("--preview", "-p", action="store_true", help="Start a local preview server without pushing")
     parser.add_argument("--no-sp", action="store_true", help="Skip SharePoint backup")
     args = parser.parse_args()
@@ -353,6 +409,9 @@ def main():
 
     affected_subjects = set()
     subjects = ["00 - ANJ", "01 - APM", "02 - Appslab", "03 - CEQ", "04 - CIT", "05 - CME", "06 - CSX", "07 - EKO", "08 - ETS", "09 - MAT", "10 - SJL", "11 - SXT", "12 - USP"]
+    
+    # Track the order of files as they appear in the command
+    run_order = {}
 
     for file_path in files_to_process:
         vault_root = find_vault_root(file_path)
@@ -363,6 +422,18 @@ def main():
         print(f"📄 Staging note: {file_path.name}")
         md_content = file_path.read_text(encoding="utf-8")
         
+        # If no H1 exists, inject a frontmatter title so the sidebar shows the original name
+        has_h1 = re.search(r'^#\s+', md_content, re.MULTILINE) is not None
+        if not has_h1:
+            if md_content.startswith("---"):
+                parts = md_content.split("---", 2)
+                if len(parts) >= 3:
+                    if "title:" not in parts[1]:
+                        md_content = f"---\ntitle: \"{file_path.stem}\"\n{parts[1]}---{parts[2]}"
+            else:
+                md_content = f"---\ntitle: \"{file_path.stem}\"\n---\n\n{md_content}"
+        
+        md_content = fix_header_hierarchy(md_content)
         md_content = convert_obsidian_callouts(md_content)
         md_content = fix_markdown_formatting(md_content)
         md_content = preprocess_math(md_content)
@@ -371,11 +442,14 @@ def main():
         subject_alias = subject_folder_name.split(" - ")[-1]
         
         safe_title = re.sub(r"[^\w\-]", "-", file_path.stem).strip("-").lower()
+        staged_name = f"{safe_title}.md"
+        
+        run_order.setdefault(subject_alias, []).append(staged_name)
         
         subject_dir = docs_dir / subject_alias
         subject_dir.mkdir(parents=True, exist_ok=True)
 
-        staged_path = subject_dir / f"{safe_title}.md"
+        staged_path = subject_dir / staged_name
         staged_path.write_text(md_content, encoding="utf-8")
         
         stat = file_path.stat()
@@ -397,7 +471,7 @@ def main():
         generate_subject_index(subject_dir, subject_alias)
 
     generate_main_index(docs_dir)
-    regenerate_config(config_path, docs_dir)
+    regenerate_config(config_path, docs_dir, run_order)
 
     print("🔨 Building static site...")
     try:
