@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import os
 from pathlib import Path
 
 import yaml
@@ -25,19 +26,25 @@ except ImportError:
 # --- CONFIGURATION ---
 CONTENT_REPO_DIR = Path("/home/martinko/Projects/spsknm-notes").resolve()
 
-ZENSICAL_CONFIG = """\
+# Base config - fixed TOML syntax for Mermaid inside the array
+BASE_ZENSICAL_CONFIG = """\
 [project]
 site_name = "SPSITKNM Notes"
 use_directory_urls = false
 extra_javascript = [
     "javascripts/mathjax.js",
-    "https://unpkg.com/mathjax@3/es5/tex-mml-chtml.js"
+    "https://unpkg.com/mathjax@3/es5/tex-mml-chtml.js",
+    "https://unpkg.com/mermaid@10/dist/mermaid.min.js"
 ]
 markdown_extensions = [
     "tables",
     "admonition",
-    "pymdownx.superfences",
-    { "pymdownx.arithmatex" = { generic = true } }
+    "nl2br",
+    "md_in_html",
+    { "pymdownx.arithmatex" = { generic = true } },
+    { "pymdownx.superfences" = { custom_fences = [
+        { name = "mermaid", class = "mermaid", format = "pymdownx.superfences.fence_code_format" }
+    ] } }
 ]
 
 [project.theme]
@@ -49,7 +56,7 @@ features = [
 ]
 """
 
-MATHJAX_JS = r"""window.MathJax = {
+DEFAULT_MATHJAX_JS = r"""window.MathJax = {
   tex: {
     inlineMath: [["\\(", "\\)"]],
     displayMath: [["\\[", "\\]"]],
@@ -69,6 +76,10 @@ document$.subscribe(() => {
 });
 """
 
+def natural_sort_key(s):
+    return [int(text) if text.isdigit() else text.lower()
+            for text in re.split(r'(\d+)', s)]
+
 def find_vault_root(file_path: Path):
     for parent in file_path.parents:
         if (parent / ".obsidian").is_dir():
@@ -84,28 +95,6 @@ def normalize_path(raw_path: str) -> Path:
     if home_index != -1:
         candidate = candidate[home_index:]
     return Path(candidate).resolve()
-
-def get_safe_filename(stem: str) -> str:
-    """Handles hierarchical numbering (e.g., 1., 1.1, 1.2) and pads them."""
-    match = re.match(r'^([\d\.]+)\s*', stem)
-    if match:
-        num_str = match.group(1).strip('.')
-        parts = [p for p in num_str.split('.') if p]
-        
-        # Pad each part to 2 digits (e.g., 1 -> 01)
-        padded = [f"{int(p):02d}" for p in parts]
-        
-        # If it's a single number (e.g., "1"), pad with 00 to sort before its children
-        if len(padded) == 1:
-            padded.append("00")
-            
-        prefix = "-".join(padded)
-        
-        title_part = stem[match.end():]
-        safe_title = re.sub(r"[^\w\-]", "-", title_part).strip("-").lower()
-        return f"{prefix}-{safe_title}" if safe_title else prefix
-    else:
-        return re.sub(r"[^\w\-]", "-", stem).strip("-").lower()
 
 def extract_attachments(md_content: str):
     return re.findall(r"!\[\[([^\]|]+)", md_content)
@@ -125,6 +114,75 @@ def find_asset_path(vault_root: Path, note_dir: Path, target: str):
         if c.is_file():
             return c
     return None
+
+def convert_obsidian_callouts(md_content: str) -> str:
+    callout_re = re.compile(r"^>\s*\[!([^\]]+)\][+-]?\s*(.*?)\n((?:^>.*(?:\n|$))*)", re.MULTILINE)
+
+    def repl(match):
+        kind = match.group(1).lower()
+        title = match.group(2).strip()
+        body = match.group(3) or ""
+
+        type_map = {
+            "hint": "tip", "check": "success", "done": "success",
+            "help": "question", "faq": "question", "caution": "warning",
+            "attention": "warning", "fail": "failure", "missing": "failure",
+            "error": "danger", "cite": "quote"
+        }
+        md_kind = type_map.get(kind, kind)
+        title_part = f' "{title}"' if title else ""
+
+        body_lines = []
+        for line in body.splitlines():
+            if line.startswith(">"):
+                line = line[1:]
+                if line.startswith(" "):
+                    line = line[1:]
+            body_lines.append("    " + line)
+
+        body_str = "\n".join(body_lines)
+        return f"!!! {md_kind}{title_part}\n{body_str}\n\n"
+
+    return callout_re.sub(repl, md_content)
+
+def fix_markdown_formatting(md_content: str) -> str:
+    lines = md_content.split('\n')
+    out_lines = []
+    in_code_block = False
+
+    for line in lines:
+        stripped = line.strip()
+
+        if stripped.startswith('```') or stripped.startswith('~~~'):
+            in_code_block = not in_code_block
+            if not in_code_block:
+                out_lines.append(line)
+                out_lines.append('')
+            else:
+                if out_lines and out_lines[-1].strip() != '':
+                    out_lines.append('')
+                out_lines.append(line)
+            continue
+
+        if in_code_block:
+            out_lines.append(line)
+            continue
+
+        if re.match(r'^[ \t]*(?:[-*+]|\d+\.)\s+', line):
+            if out_lines and out_lines[-1].strip() != '':
+                if not re.match(r'^[ \t]*(?:[-*+]|\d+\.)\s+', out_lines[-1]):
+                    if not re.match(r'^[ \t]+', out_lines[-1]):
+                        out_lines.append('')
+
+        out_lines.append(line)
+
+    cleaned = []
+    for line in out_lines:
+        if line.strip() == '' and cleaned and cleaned[-1].strip() == '':
+            continue
+        cleaned.append(line)
+
+    return '\n'.join(cleaned)
 
 def preprocess_math(md):
     code_blocks = []
@@ -167,31 +225,7 @@ def extract_metadata(file_path: Path):
             if m:
                 title = m.group(1).strip()
 
-        date_str = None
-        if isinstance(fm, dict):
-            for key in ("date", "published", "publish_date", "publish-date"):
-                if key in fm and fm[key]:
-                    date_str = str(fm[key])
-                    break
-        
-        parsed_date = None
-        if date_str:
-            try:
-                parsed_date = dt.datetime.strptime(date_str.strip()[:10], "%Y-%m-%d").date()
-            except ValueError:
-                pass
-                
-        if not parsed_date:
-            m = re.search(r'(\d{4}-\d{2}-\d{2})', file_path.stem)
-            if m:
-                try:
-                    parsed_date = dt.datetime.strptime(m.group(1), "%Y-%m-%d").date()
-                except ValueError:
-                    pass
-                    
-        if not parsed_date:
-            parsed_date = dt.date.fromtimestamp(file_path.stat().st_mtime)
-
+        parsed_date = dt.date.fromtimestamp(file_path.stat().st_mtime)
         return title, parsed_date
     except Exception:
         return file_path.stem, dt.date.today()
@@ -204,11 +238,9 @@ def generate_subject_index(subject_dir: Path, subject_alias: str):
         title, date = extract_metadata(p)
         notes.append((date, title, p.name))
         
-    # Sort primarily by date (newest first), then by filename (A-Z) if dates match
-    notes.sort(key=lambda x: x[2]) # First alphabetical by filename
-    notes.sort(key=lambda x: x[0], reverse=True) # Then newest by date
+    notes.sort(key=lambda x: natural_sort_key(x[2]))
     
-    lines = [f"# {subject_alias}\n", "Zoznam poznámok zoradený podľa dátumu:\n"]
+    lines = [f"# {subject_alias}\n", "Zoznam poznámok:\n"]
     
     if not notes:
         lines.append("*Zatiaľ žiadne poznámky.*")
@@ -217,6 +249,71 @@ def generate_subject_index(subject_dir: Path, subject_alias: str):
             lines.append(f"- **{date.strftime('%Y-%m-%d')}** &mdash; [{title}]({filename})")
             
     (subject_dir / "index.md").write_text("\n".join(lines), encoding="utf-8")
+
+def generate_main_index(docs_dir: Path):
+    subjects = ["00 - ANJ", "01 - APM", "02 - Appslab", "03 - CEQ", "04 - CIT", "05 - CME", "06 - CSX", "07 - EKO", "08 - ETS", "09 - MAT", "10 - SJL", "11 - SXT", "12 - USP"]
+    alias_to_full = {s.split(" - ")[-1]: s for s in subjects}
+    
+    existing_aliases = []
+    for d in docs_dir.iterdir():
+        if d.is_dir() and d.name in alias_to_full:
+            existing_aliases.append(d.name)
+            
+    existing_aliases.sort()
+    
+    icons = {
+        "ANJ": "🇬🇧", "APM": "📐", "Appslab": "📱", "CEQ": "🧪", "CIT": "💻",
+        "CME": "⚙️", "CSX": "🖥️", "EKO": "📈", "ETS": "🔌", "MAT": "🧮",
+        "SJL": "📖", "SXT": "🌐", "USP": "🏛️"
+    }
+    
+    html_out = [
+        "# SPSITKNM Notes\n",
+        "Vitajte v poznámkach. Vyberte si predmet:\n\n",
+        '<div class="grid" style="display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: 1.5rem; margin-top: 2rem;">\n'
+    ]
+    
+    for alias in existing_aliases:
+        icon = icons.get(alias, "📁")
+        link = f"{alias}/index.html"
+        
+        html_out.append(f'''\
+    <a href="{link}" style="display: flex; flex-direction: column; padding: 1.5rem; border: 1px solid var(--md-default-fg-color--lightest); border-radius: 8px; text-decoration: none; background-color: var(--md-code-bg-color); transition: transform 0.2s, box-shadow 0.2s, border-color 0.2s; box-shadow: 0 2px 4px rgba(0,0,0,0.05);">
+        <h2 style="margin-top: 0; margin-bottom: 0.5rem; font-size: 1.5rem; color: var(--md-primary-fg-color); display: flex; align-items: center; gap: 0.5rem;">
+            <span>{icon}</span> {alias}
+        </h2>
+        <p style="margin: 0; color: var(--md-default-fg-color--light); font-size: 0.9rem;">Poznámky pre predmet</p>
+    </a>
+''')
+    
+    html_out.append('</div>\n')
+    
+    (docs_dir / "index.md").write_text("".join(html_out), encoding="utf-8")
+
+def regenerate_config(config_path: Path, docs_dir: Path):
+    """Forces a clean generation of zensical.toml to fix any manual edits or bugs."""
+    nav_items = []
+    for subject_dir in sorted(docs_dir.iterdir(), key=lambda p: p.name):
+        if subject_dir.is_dir() and subject_dir.name not in ("javascripts",):
+            subject_alias = subject_dir.name
+            files = []
+            for p in subject_dir.glob("*.md"):
+                if p.name != "index.md":
+                    files.append(p.name)
+            
+            files.sort(key=natural_sort_key)
+            
+            sub_nav_files = [f'"{subject_alias}/index.md"']
+            for filename in files:
+                sub_nav_files.append(f'"{subject_alias}/{filename}"')
+                
+            files_str = ",\n                ".join(sub_nav_files)
+            nav_items.append(f'    {{ "{subject_alias}" = [\n                {files_str}\n            ] }}')
+
+    nav_str = ",\n".join(nav_items)
+    full_content = BASE_ZENSICAL_CONFIG + f"\nnav = [\n{nav_str}\n]\n" if nav_items else BASE_ZENSICAL_CONFIG
+    
+    config_path.write_text(full_content, encoding="utf-8")
 
 def main():
     parser = argparse.ArgumentParser()
@@ -245,32 +342,18 @@ def main():
     docs_dir = CONTENT_REPO_DIR / "docs"
     docs_dir.mkdir(parents=True, exist_ok=True)
 
-    # --- CLEANUP GHOST FILES ---
-    subjects = ["00 - ANJ", "01 - APM", "02 - Appslab", "03 - CEQ", "04 - CIT", "05 - CME", "06 - CSX", "07 - EKO", "08 - ETS", "09 - MAT", "10 - SJL", "11 - SXT", "12 - USP"]
-    valid_capitalized_folders = [s.split(" - ")[-1] for s in subjects]
-    
-    for item in docs_dir.iterdir():
-        if item.is_file() and item.name != "index.md":
-            item.unlink()
-        elif item.is_dir() and item.name not in ("javascripts", *valid_capitalized_folders):
-            if item.name.lower() in [f.lower() for f in valid_capitalized_folders]:
-                shutil.rmtree(item)
-    # ---------------------------
-
     config_path = CONTENT_REPO_DIR / "zensical.toml"
-    config_path.write_text(ZENSICAL_CONFIG, encoding="utf-8")
 
     js_dir = docs_dir / "javascripts"
     js_dir.mkdir(exist_ok=True)
-    (js_dir / "mathjax.js").write_text(MATHJAX_JS, encoding="utf-8")
-
-    index_md = docs_dir / "index.md"
-    if not index_md.exists():
-        index_md.write_text("# SPSITKNM Notes\n\nVitajte v poznámkach. Vyberte si predmet z horného menu.", encoding="utf-8")
+    
+    mathjax_path = js_dir / "mathjax.js"
+    if not mathjax_path.exists():
+        mathjax_path.write_text(DEFAULT_MATHJAX_JS, encoding="utf-8")
 
     affected_subjects = set()
+    subjects = ["00 - ANJ", "01 - APM", "02 - Appslab", "03 - CEQ", "04 - CIT", "05 - CME", "06 - CSX", "07 - EKO", "08 - ETS", "09 - MAT", "10 - SJL", "11 - SXT", "12 - USP"]
 
-    # --- PROCESS FILES ---
     for file_path in files_to_process:
         vault_root = find_vault_root(file_path)
         if not vault_root:
@@ -279,18 +362,24 @@ def main():
 
         print(f"📄 Staging note: {file_path.name}")
         md_content = file_path.read_text(encoding="utf-8")
+        
+        md_content = convert_obsidian_callouts(md_content)
+        md_content = fix_markdown_formatting(md_content)
         md_content = preprocess_math(md_content)
         
         subject_folder_name = next((p.name for p in file_path.parents if p.name in subjects), "misc")
         subject_alias = subject_folder_name.split(" - ")[-1]
         
-        safe_title = get_safe_filename(file_path.stem)
+        safe_title = re.sub(r"[^\w\-]", "-", file_path.stem).strip("-").lower()
         
         subject_dir = docs_dir / subject_alias
         subject_dir.mkdir(parents=True, exist_ok=True)
 
         staged_path = subject_dir / f"{safe_title}.md"
         staged_path.write_text(md_content, encoding="utf-8")
+        
+        stat = file_path.stat()
+        os.utime(staged_path, (stat.st_atime, stat.st_mtime))
 
         attachments = extract_attachments(md_content)
         if attachments:
@@ -304,9 +393,11 @@ def main():
                     
         affected_subjects.add((subject_dir, subject_alias))
 
-    # --- GENERATE INDEXES ---
     for subject_dir, subject_alias in affected_subjects:
         generate_subject_index(subject_dir, subject_alias)
+
+    generate_main_index(docs_dir)
+    regenerate_config(config_path, docs_dir)
 
     print("🔨 Building static site...")
     try:
@@ -327,11 +418,7 @@ def main():
             if args.preview:
                 print("\n👀 Starting local preview server...")
                 print("   Press Ctrl+C to stop the preview and exit.")
-                if files_to_process:
-                    first_file = files_to_process[0]
-                    first_subject = next((p.name for p in first_file.parents if p.name in subjects), "misc").split(" - ")[-1]
-                    first_title = get_safe_filename(first_file.stem)
-                    print(f"   Example URL: http://127.0.0.1:8000/{first_subject}/{first_title}.html\n")
+                print(f"   URL: http://127.0.0.1:8000/index.html\n")
                 try:
                     subprocess.run(["zensical", "serve"], cwd=str(temp_path))
                 except KeyboardInterrupt:
@@ -348,7 +435,6 @@ def main():
     print("🚀 Pushing to Content Repo Git...")
     try:
         subprocess.run(["git", "rev-parse", "--is-inside-work-tree"], cwd=str(CONTENT_REPO_DIR), check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        
         subprocess.run(["git", "add", "."], cwd=str(CONTENT_REPO_DIR), check=True)
         
         status = subprocess.run(["git", "status", "--porcelain"], cwd=str(CONTENT_REPO_DIR), capture_output=True, text=True)
