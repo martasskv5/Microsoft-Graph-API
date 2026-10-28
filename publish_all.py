@@ -26,9 +26,11 @@ except ImportError:
 # --- CONFIGURATION ---
 CONTENT_REPO_DIR = Path("/home/martinko/Projects/spsknm-notes").resolve()
 
+# Moved # NAV_PLACEHOLDER ABOVE [project.extra] to ensure TOML parses it correctly
 BASE_ZENSICAL_CONFIG = """\
 [project]
-site_name = "SPSITKNM Notes"
+site_name = "notes.michalec.it"
+site_url = "https://notes.michalec.it/"
 copyright = "Copyright &copy; 2026 Martin Michalec"
 use_directory_urls = false
 extra_javascript = [
@@ -41,6 +43,7 @@ markdown_extensions = [
     "admonition",
     "nl2br",
     "md_in_html",
+    "attr_list",
     { "pymdownx.arithmatex" = { generic = true } },
     { "pymdownx.superfences" = { custom_fences = [
         { name = "mermaid", class = "mermaid", format = "pymdownx.superfences.fence_code_format" }
@@ -50,6 +53,9 @@ markdown_extensions = [
 
 # NAV_PLACEHOLDER
 
+[project.extra]
+generator = false
+
 [project.theme]
 name = "material"
 language = "sk"
@@ -57,7 +63,9 @@ features = [
     "navigation.footer",
     "navigation.tabs",
     "navigation.sections",
-    "content.code.copy"
+    "content.code.copy",
+    "navigation.instant",
+    "navigation.instant.preview"
 ]
 
 [[project.theme.palette]]
@@ -140,6 +148,63 @@ def find_asset_path(vault_root: Path, note_dir: Path, target: str):
         if c.is_file():
             return c
     return None
+
+def convert_obsidian_links(md_content: str, current_subject: str, all_files_map: dict) -> str:
+    code_blocks = []
+    def save_code(m):
+        code_blocks.append(m.group(0))
+        return f"@@CODEBLOCK{len(code_blocks)-1}@@"
+    md = re.sub(r'(```.*?```|`[^`]*`)', save_code, md_content, flags=re.DOTALL)
+
+    def repl(match):
+        inner = match.group(1).strip()
+        if "|" in inner:
+            target_part, display_text = inner.split("|", 1)
+        else:
+            target_part = inner
+            display_text = inner.split("#")[0].strip()
+        
+        target_part = target_part.strip()
+        display_text = display_text.strip()
+        
+        anchor = ""
+        if "#" in target_part:
+            target_part, anchor = target_part.split("#", 1)
+            anchor = "#" + anchor.strip()
+        
+        target_part = target_part.strip()
+        target_lower = target_part.lower()
+        
+        resolved = None
+        if "/" in target_lower:
+            subj, name = target_lower.split("/", 1)
+            subj = subj.strip()
+            name = name.strip()
+            if (subj, name) in all_files_map:
+                resolved = all_files_map[(subj, name)]
+                if subj != current_subject:
+                    resolved = f"../{subj}/{resolved}"
+        else:
+            if (current_subject, target_lower) in all_files_map:
+                resolved = all_files_map[(current_subject, target_lower)]
+            else:
+                for (subj, name), path in all_files_map.items():
+                    if name == target_lower:
+                        resolved = f"../{subj}/{path}"
+                        break
+                        
+        if resolved:
+            return f"[{display_text}]({resolved}{anchor}){{ data-preview }}"
+        else:
+            safe_target = re.sub(r"[^\w\-]", "-", target_part).strip("-").lower()
+            return f"[{display_text}]({safe_target}.md{anchor}){{ data-preview }}"
+
+    md = re.sub(r"\[\[([^\]]+)\]\]", repl, md)
+
+    for i, block in enumerate(code_blocks):
+        md = md.replace(f"@@CODEBLOCK{i}@@", block)
+
+    return md
 
 def fix_header_hierarchy(md_content: str) -> str:
     lines = md_content.split('\n')
@@ -288,7 +353,7 @@ def generate_subject_index(subject_dir: Path, subject_alias: str):
         lines.append("*Zatiaľ žiadne poznámky.*")
     else:
         for date, title, filename in notes:
-            lines.append(f"- **{date.strftime('%Y-%m-%d')}** &mdash; [{title}]({filename})")
+            lines.append(f"- **{date.strftime('%Y-%m-%d')}** &mdash; [{title}]({filename}){{ data-preview }}")
             
     (subject_dir / "index.md").write_text("\n".join(lines), encoding="utf-8")
 
@@ -339,7 +404,6 @@ def regenerate_config(config_path: Path, docs_dir: Path, run_order: dict):
             subject_alias = subject_dir.name
             files = list(subject_dir.glob("*.md"))
             
-            # Prioritize files based on the command-line order
             ordered_files = []
             for fname in run_order.get(subject_alias, []):
                 fpath = subject_dir / fname
@@ -410,9 +474,9 @@ def main():
     affected_subjects = set()
     subjects = ["00 - ANJ", "01 - APM", "02 - Appslab", "03 - CEQ", "04 - CIT", "05 - CME", "06 - CSX", "07 - EKO", "08 - ETS", "09 - MAT", "10 - SJL", "11 - SXT", "12 - USP"]
     
-    # Track the order of files as they appear in the command
     run_order = {}
 
+    # --- PASS 1: Stage raw files ---
     for file_path in files_to_process:
         vault_root = find_vault_root(file_path)
         if not vault_root:
@@ -421,22 +485,6 @@ def main():
 
         print(f"📄 Staging note: {file_path.name}")
         md_content = file_path.read_text(encoding="utf-8")
-        
-        # If no H1 exists, inject a frontmatter title so the sidebar shows the original name
-        has_h1 = re.search(r'^#\s+', md_content, re.MULTILINE) is not None
-        if not has_h1:
-            if md_content.startswith("---"):
-                parts = md_content.split("---", 2)
-                if len(parts) >= 3:
-                    if "title:" not in parts[1]:
-                        md_content = f"---\ntitle: \"{file_path.stem}\"\n{parts[1]}---{parts[2]}"
-            else:
-                md_content = f"---\ntitle: \"{file_path.stem}\"\n---\n\n{md_content}"
-        
-        md_content = fix_header_hierarchy(md_content)
-        md_content = convert_obsidian_callouts(md_content)
-        md_content = fix_markdown_formatting(md_content)
-        md_content = preprocess_math(md_content)
         
         subject_folder_name = next((p.name for p in file_path.parents if p.name in subjects), "misc")
         subject_alias = subject_folder_name.split(" - ")[-1]
@@ -466,6 +514,46 @@ def main():
                     print(f"   ⚠️  Attachment not found: {att}")
                     
         affected_subjects.add((subject_dir, subject_alias))
+
+    # --- PASS 2: Post-process and convert links ---
+    print("🔗 Resolving Obsidian wikilinks...")
+    all_files_map = {}
+    for subj_dir in docs_dir.iterdir():
+        if subj_dir.is_dir() and subj_dir.name not in ("javascripts", "assets"):
+            for md_file in subj_dir.glob("*.md"):
+                if md_file.name == "index.md":
+                    continue
+                title, _ = extract_metadata(md_file)
+                all_files_map[(subj_dir.name, title.lower())] = md_file.name
+                safe_name = re.sub(r"[^\w\-]", "-", title).strip("-").lower()
+                all_files_map[(subj_dir.name, safe_name)] = md_file.name
+                orig_stem = md_file.stem.lower()
+                all_files_map[(subj_dir.name, orig_stem)] = md_file.name
+
+    for subj_dir in docs_dir.iterdir():
+        if subj_dir.is_dir() and subj_dir.name not in ("javascripts", "assets"):
+            for md_file in subj_dir.glob("*.md"):
+                if md_file.name == "index.md":
+                    continue
+                content = md_file.read_text(encoding="utf-8")
+                
+                content = fix_header_hierarchy(content)
+                content = convert_obsidian_links(content, subj_dir.name, all_files_map)
+                content = convert_obsidian_callouts(content)
+                content = fix_markdown_formatting(content)
+                content = preprocess_math(content)
+                
+                has_h1 = re.search(r'^#\s+', content, re.MULTILINE) is not None
+                if not has_h1:
+                    if content.startswith("---"):
+                        parts = content.split("---", 2)
+                        if len(parts) >= 3:
+                            if "title:" not in parts[1]:
+                                content = f"---\ntitle: \"{md_file.stem}\"\n{parts[1]}---{parts[2]}"
+                    else:
+                        content = f"---\ntitle: \"{md_file.stem}\"\n---\n\n{content}"
+                        
+                md_file.write_text(content, encoding="utf-8")
 
     for subject_dir, subject_alias in affected_subjects:
         generate_subject_index(subject_dir, subject_alias)

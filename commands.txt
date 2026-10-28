@@ -1,0 +1,27 @@
+# preview
+
+export FILE_PATH="/home/martinko/OneDrive - MSFT/Skola/SPSITknm 26-27"
+
+python publish_all.py --preview \
+  --file "$FILE_PATH/09 - MAT/1. Postupnosť.md" \
+  --file "$FILE_PATH/09 - MAT/2. Aritmetická Postupnosť.md" \
+  --file "$FILE_PATH/09 - MAT/3. Geometrická Postupnosť.md" \
+  --file "$FILE_PATH/01 - APM/1. Matice.md" \
+  --file "$FILE_PATH/01 - APM/2. Hodnost Matice.md" \
+  --file "$FILE_PATH/01 - APM/3. Regularna a Inverzna Matica.md" \
+  --file "$FILE_PATH/10 - SJL/MOTAZKY.md" \
+  --file "$FILE_PATH/10 - SJL/Zhrnutie 1-5.md" \
+  --file "$FILE_PATH/10 - SJL/1.G.md" \
+  --file "$FILE_PATH/10 - SJL/1.L.md" \
+  --file "$FILE_PATH/10 - SJL/2...L.md" \
+  --file "$FILE_PATH/10 - SJL/2..G.md" \
+  --file "$FILE_PATH/10 - SJL/2..L.md" \
+  --file "$FILE_PATH/10 - SJL/2.G.md" \
+  --file "$FILE_PATH/10 - SJL/2.L.md" \
+  --file "$FILE_PATH/10 - SJL/3..L.md" \
+  --file "$FILE_PATH/10 - SJL/3.G.md" \
+  --file "$FILE_PATH/10 - SJL/3.L.md" \
+  --file "$FILE_PATH/10 - SJL/4.G.md" \
+  --file "$FILE_PATH/10 - SJL/4.L.md" \
+  --file "$FILE_PATH/10 - SJL/5.G.md" \
+  --file "$FILE_PATH/10 - SJL/5.L.md" 
