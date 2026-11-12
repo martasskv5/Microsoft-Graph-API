@@ -13,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 import os
+import urllib.parse
 from pathlib import Path
 
 import yaml
@@ -26,7 +27,6 @@ except ImportError:
 # --- CONFIGURATION ---
 CONTENT_REPO_DIR = Path("/home/martinko/Projects/spsknm-notes").resolve()
 
-# Moved # NAV_PLACEHOLDER ABOVE [project.extra] to ensure TOML parses it correctly
 BASE_ZENSICAL_CONFIG = """\
 [project]
 site_name = "notes.michalec.it"
@@ -48,7 +48,7 @@ markdown_extensions = [
     { "pymdownx.superfences" = { custom_fences = [
         { name = "mermaid", class = "mermaid", format = "pymdownx.superfences.fence_code_format" }
     ] } },
-    { "toc" = { toc_depth = "2-6" } }
+    { "toc" = { toc_depth = "1-6" } }
 ]
 
 # NAV_PLACEHOLDER
@@ -149,7 +149,10 @@ def find_asset_path(vault_root: Path, note_dir: Path, target: str):
             return c
     return None
 
-def convert_obsidian_links(md_content: str, current_subject: str, all_files_map: dict) -> str:
+def convert_obsidian_links(md_content: str, current_subject: str, all_files_map: dict, attachment_map: dict = None, docs_dir: Path = None) -> str:
+    if attachment_map is None:
+        attachment_map = {}
+        
     code_blocks = []
     def save_code(m):
         code_blocks.append(m.group(0))
@@ -157,7 +160,9 @@ def convert_obsidian_links(md_content: str, current_subject: str, all_files_map:
     md = re.sub(r'(```.*?```|`[^`]*`)', save_code, md_content, flags=re.DOTALL)
 
     def repl(match):
-        inner = match.group(1).strip()
+        is_image = match.group(1) == "!"
+        inner = match.group(2).strip()
+        
         if "|" in inner:
             target_part, display_text = inner.split("|", 1)
         else:
@@ -167,6 +172,40 @@ def convert_obsidian_links(md_content: str, current_subject: str, all_files_map:
         target_part = target_part.strip()
         display_text = display_text.strip()
         
+        # --- Handle image embeds ---
+        if is_image:
+            img_path = attachment_map.get(target_part)
+            if not img_path:
+                img_path = attachment_map.get(Path(target_part).name)
+            
+            if not img_path:
+                # Fallback: try to find the image in the docs directory
+                filename = Path(target_part).name
+                if docs_dir:
+                    for p in docs_dir.rglob(filename):
+                        if p.is_file():
+                            subject_dir = docs_dir / current_subject
+                            try:
+                                img_path = p.relative_to(subject_dir).as_posix()
+                            except ValueError:
+                                img_path = p.relative_to(docs_dir).as_posix()
+                            break
+                if not img_path:
+                    parts = target_part.split("/", 1)
+                    if len(parts) == 2 and current_subject in parts[0]:
+                        img_path = parts[1]
+                    else:
+                        img_path = target_part
+                    
+            # Use filename as alt text if not explicitly provided
+            alt_text = display_text if display_text != target_part else Path(target_part).name
+            
+            # URL-encode the path to handle spaces and special characters
+            img_path_encoded = urllib.parse.quote(img_path)
+            
+            return f"![{alt_text}]({img_path_encoded})"
+        
+        # --- Handle regular links ---
         anchor = ""
         if "#" in target_part:
             target_part, anchor = target_part.split("#", 1)
@@ -199,7 +238,7 @@ def convert_obsidian_links(md_content: str, current_subject: str, all_files_map:
             safe_target = re.sub(r"[^\w\-]", "-", target_part).strip("-").lower()
             return f"[{display_text}]({safe_target}.md{anchor}){{ data-preview }}"
 
-    md = re.sub(r"\[\[([^\]]+)\]\]", repl, md)
+    md = re.sub(r"(!?)\[\[([^\]]+)\]\]", repl, md)
 
     for i, block in enumerate(code_blocks):
         md = md.replace(f"@@CODEBLOCK{i}@@", block)
@@ -207,15 +246,44 @@ def convert_obsidian_links(md_content: str, current_subject: str, all_files_map:
     return md
 
 def fix_header_hierarchy(md_content: str) -> str:
+    """
+    Zabezpečí, že existuje len jeden H1. 
+    Ak nájde ďalší H1, zmení ho na H2 a všetky podnadpisy pod ním posunie o úroveň nižšie.
+    """
     lines = md_content.split('\n')
     h1_count = 0
     out_lines = []
+    in_code_block = False
+    offset = 0 
     
     for line in lines:
-        if line.startswith('# ') and not line.startswith('## '):
-            h1_count += 1
-            if h1_count > 1:
-                line = '## ' + line[2:]
+        stripped = line.strip()
+        
+        if stripped.startswith('```') or stripped.startswith('~~~'):
+            in_code_block = not in_code_block
+            
+        if not in_code_block and re.match(r'^#+\s', line):
+            match = re.match(r'^(#+)\s+(.*)', line)
+            if match:
+                hashes = match.group(1)
+                text = match.group(2)
+                level = len(hashes)
+                
+                if level == 1:
+                    h1_count += 1
+                    if h1_count > 1:
+                        # Druhý a ďalší H1 zmeníme na H2 a nastavíme offset pre deti
+                        level = 2
+                        offset = 1
+                    else:
+                        offset = 0
+                
+                if h1_count > 1 and level > 1:
+                    level = level + offset
+                    if level > 6: level = 6
+                    
+                line = '#' * level + ' ' + text
+
         out_lines.append(line)
         
     return '\n'.join(out_lines)
@@ -475,6 +543,7 @@ def main():
     subjects = ["00 - ANJ", "01 - APM", "02 - Appslab", "03 - CEQ", "04 - CIT", "05 - CME", "06 - CSX", "07 - EKO", "08 - ETS", "09 - MAT", "10 - SJL", "11 - SXT", "12 - USP"]
     
     run_order = {}
+    attachment_map = {}
 
     # --- PASS 1: Stage raw files ---
     for file_path in files_to_process:
@@ -509,7 +578,19 @@ def main():
             for att in attachments:
                 src = find_asset_path(vault_root, file_path.parent, att.strip())
                 if src:
-                    shutil.copy2(src, subject_dir / src.name)
+                    try:
+                        rel_path = src.relative_to(vault_root)
+                        if rel_path.parts[0] == subject_folder_name:
+                            rel_path = Path(*rel_path.parts[1:])
+                    except ValueError:
+                        rel_path = Path(src.name)
+                    
+                    dest = subject_dir / rel_path
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(src, dest)
+                    
+                    attachment_map[att] = rel_path.as_posix()
+                    attachment_map[Path(att).name] = rel_path.as_posix()
                 else:
                     print(f"   ⚠️  Attachment not found: {att}")
                     
@@ -538,7 +619,7 @@ def main():
                 content = md_file.read_text(encoding="utf-8")
                 
                 content = fix_header_hierarchy(content)
-                content = convert_obsidian_links(content, subj_dir.name, all_files_map)
+                content = convert_obsidian_links(content, subj_dir.name, all_files_map, attachment_map, docs_dir)
                 content = convert_obsidian_callouts(content)
                 content = fix_markdown_formatting(content)
                 content = preprocess_math(content)
