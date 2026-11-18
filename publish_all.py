@@ -7,10 +7,12 @@ and pushes a backup to SharePoint.
 
 import argparse
 import datetime as dt
+import hashlib
 import re
 import shutil
 import subprocess
 import sys
+import tikra
 import tempfile
 import os
 import urllib.parse
@@ -33,10 +35,15 @@ site_name = "notes.michalec.it"
 site_url = "https://notes.michalec.it/"
 copyright = "Copyright &copy; 2026 Martin Michalec"
 use_directory_urls = false
+extra_css = [
+    "https://cdn.jsdelivr.net/npm/@rod2ik/tikzjax@latest/dist/fonts.min.css"
+]
 extra_javascript = [
     "javascripts/mathjax.js",
     "https://unpkg.com/mathjax@3/es5/tex-mml-chtml.js",
-    "https://unpkg.com/mermaid@10/dist/mermaid.min.js"
+    "https://unpkg.com/mermaid@10/dist/mermaid.min.js",
+    "javascripts/tikzjax.config.js",
+    "https://cdn.jsdelivr.net/npm/@rod2ik/tikzjax@latest/dist/tikzjax.min.js"
 ]
 markdown_extensions = [
     "tables",
@@ -46,7 +53,8 @@ markdown_extensions = [
     "attr_list",
     { "pymdownx.arithmatex" = { generic = true } },
     { "pymdownx.superfences" = { custom_fences = [
-        { name = "mermaid", class = "mermaid", format = "pymdownx.superfences.fence_code_format" }
+        { name = "mermaid", class = "mermaid", format = "pymdownx.superfences.fence_code_format" },
+        { name = "tikzjax", class = "language-tikzjax", format = "pymdownx.superfences.fence_code_format" }
     ] } },
     { "toc" = { toc_depth = "1-6" } }
 ]
@@ -108,6 +116,30 @@ document$.subscribe(() => {
   MathJax.texReset();
   MathJax.typesetPromise();
 });
+"""
+
+DEFAULT_TIKZJAX_CONFIG = r"""window.TikzJaxOptions = {
+  renderTimeout: 30000,
+  maxRetries: 1,
+  restartWorkerOnFail: true,
+  brokenImageSrc: "https://cdn.jsdelivr.net/npm/@rod2ik/tikzjax@1.6.0/dist/assets/broken-image.svg",
+  workerPool: {
+    enabled: true,
+    maxWorkers: 3,
+    reserveCpuCores: 1,
+    useDeviceMemory: true,
+    initializationRetries: 1
+  },
+  theme: {
+    selector: "body",
+    applyTargetStyles: false,
+    attribute: "data-md-color-scheme",
+    darkValue: "slate",
+    lightValue: "default",
+    fallbackTheme: "light",
+    followSystemTheme: true
+  }
+};
 """
 
 def natural_sort_key(s):
@@ -172,14 +204,12 @@ def convert_obsidian_links(md_content: str, current_subject: str, all_files_map:
         target_part = target_part.strip()
         display_text = display_text.strip()
         
-        # --- Handle image embeds ---
         if is_image:
             img_path = attachment_map.get(target_part)
             if not img_path:
                 img_path = attachment_map.get(Path(target_part).name)
             
             if not img_path:
-                # Fallback: try to find the image in the docs directory
                 filename = Path(target_part).name
                 if docs_dir:
                     for p in docs_dir.rglob(filename):
@@ -197,15 +227,10 @@ def convert_obsidian_links(md_content: str, current_subject: str, all_files_map:
                     else:
                         img_path = target_part
                     
-            # Use filename as alt text if not explicitly provided
             alt_text = display_text if display_text != target_part else Path(target_part).name
-            
-            # URL-encode the path to handle spaces and special characters
             img_path_encoded = urllib.parse.quote(img_path)
-            
             return f"![{alt_text}]({img_path_encoded})"
         
-        # --- Handle regular links ---
         anchor = ""
         if "#" in target_part:
             target_part, anchor = target_part.split("#", 1)
@@ -246,10 +271,6 @@ def convert_obsidian_links(md_content: str, current_subject: str, all_files_map:
     return md
 
 def fix_header_hierarchy(md_content: str) -> str:
-    """
-    Zabezpečí, že existuje len jeden H1. 
-    Ak nájde ďalší H1, zmení ho na H2 a všetky podnadpisy pod ním posunie o úroveň nižšie.
-    """
     lines = md_content.split('\n')
     h1_count = 0
     out_lines = []
@@ -272,7 +293,6 @@ def fix_header_hierarchy(md_content: str) -> str:
                 if level == 1:
                     h1_count += 1
                     if h1_count > 1:
-                        # Druhý a ďalší H1 zmeníme na H2 a nastavíme offset pre deti
                         level = 2
                         offset = 1
                     else:
@@ -357,6 +377,56 @@ def fix_markdown_formatting(md_content: str) -> str:
 
     return '\n'.join(cleaned)
 
+def preprocess_tikz(md_content: str) -> str:
+    pattern = re.compile(
+        r'^```tikz\s*\n(.*?)^```',
+        re.MULTILINE | re.DOTALL
+    )
+
+    def repl(match: re.Match) -> str:
+        body = match.group(1)
+        return f'```tikzjax\n{body}```'
+
+    return pattern.sub(repl, md_content)
+
+def render_tikz_to_svg(md_content: str, docs_dir: Path) -> str:
+    """
+    Finds ```tikz code blocks, renders them to SVG using tikra,
+    saves them to docs/assets/tikz/, and replaces the block with an image link.
+    """
+    pattern = re.compile(
+        r'^```tikz\s*\n(.*?)^```',
+        re.MULTILINE | re.DOTALL
+    )
+    
+    assets_dir = docs_dir / "assets" / "tikz"
+    assets_dir.mkdir(parents=True, exist_ok=True)
+
+    def repl(match: re.Match) -> str:
+        body = match.group(1).strip()
+        
+        # Generate a deterministic hash for the filename based on the code
+        hash_name = hashlib.md5(body.encode('utf-8')).hexdigest()
+        filename = f"{hash_name}.svg"
+        filepath = assets_dir / filename
+        
+        # Render only if the file doesn't already exist (caching)
+        if not filepath.exists():
+            try:
+                # tikra handles full documents or bare tikzpictures
+                svg_content = tikra.tikz_to_svg(body)
+                filepath.write_text(svg_content, encoding="utf-8")
+                print(f"   🎨 Rendered TikZ to SVG: {filename}")
+            except Exception as e:
+                print(f"   ⚠️  TikZ render failed: {e}")
+                # Fallback to keeping it as a code block if rendering fails
+                return f"```tikz\n{body}\n```"
+                
+        # Return standard markdown image link pointing to the generated SVG
+        return f"![TikZ Diagram](../assets/tikz/{filename})"
+
+    return pattern.sub(repl, md_content)
+
 def preprocess_math(md):
     md = re.sub(r'\\(xrightarrow|xleftarrow)\{([^{}]*\\\\[^{}]*)\}', r'\\\1{\\substack{\2}}', md)
 
@@ -413,7 +483,7 @@ def generate_subject_index(subject_dir: Path, subject_alias: str):
         title, date = extract_metadata(p)
         notes.append((date, title, p.name))
         
-    notes.sort(key=lambda x: natural_sort_key(x[1]))
+    notes.sort(key=lambda x: x[0])
     
     lines = [f"# {subject_alias}\n", "Zoznam poznámok:\n"]
     
@@ -468,23 +538,16 @@ def generate_main_index(docs_dir: Path):
 def regenerate_config(config_path: Path, docs_dir: Path, run_order: dict):
     nav_items = []
     for subject_dir in sorted(docs_dir.iterdir(), key=lambda p: p.name):
-        if subject_dir.is_dir() and subject_dir.name not in ("javascripts",):
+        # 👇 ADD "assets" TO THE EXCLUSION LIST HERE
+        if subject_dir.is_dir() and subject_dir.name not in ("javascripts", "assets"):
             subject_alias = subject_dir.name
             files = list(subject_dir.glob("*.md"))
             
-            ordered_files = []
-            for fname in run_order.get(subject_alias, []):
-                fpath = subject_dir / fname
-                if fpath in files:
-                    ordered_files.append(fpath)
-            
-            rest_files = [f for f in files if f not in ordered_files]
-            rest_files.sort(key=lambda p: natural_sort_key(extract_metadata(p)[0]))
-            
-            final_files = ordered_files + rest_files
+            # --- Newest items at the end: sort by modification date (oldest → newest) ---
+            files.sort(key=lambda p: extract_metadata(p)[1])
             
             sub_nav = []
-            for p in final_files:
+            for p in files:
                 if p.name == "index.md":
                     continue
                 title, _ = extract_metadata(p)
@@ -502,6 +565,11 @@ def regenerate_config(config_path: Path, docs_dir: Path, run_order: dict):
 
     full_content = BASE_ZENSICAL_CONFIG.replace("# NAV_PLACEHOLDER", nav_block)
     config_path.write_text(full_content, encoding="utf-8")
+
+def write_tikzjax_config(js_dir: Path):
+    config_path = js_dir / "tikzjax.config.js"
+    if not config_path.exists():
+        config_path.write_text(DEFAULT_TIKZJAX_CONFIG, encoding="utf-8")
 
 def main():
     parser = argparse.ArgumentParser()
@@ -538,6 +606,8 @@ def main():
     mathjax_path = js_dir / "mathjax.js"
     if not mathjax_path.exists():
         mathjax_path.write_text(DEFAULT_MATHJAX_JS, encoding="utf-8")
+
+    write_tikzjax_config(js_dir)
 
     affected_subjects = set()
     subjects = ["00 - ANJ", "01 - APM", "02 - Appslab", "03 - CEQ", "04 - CIT", "05 - CME", "06 - CSX", "07 - EKO", "08 - ETS", "09 - MAT", "10 - SJL", "11 - SXT", "12 - USP"]
@@ -621,6 +691,8 @@ def main():
                 content = fix_header_hierarchy(content)
                 content = convert_obsidian_links(content, subj_dir.name, all_files_map, attachment_map, docs_dir)
                 content = convert_obsidian_callouts(content)
+                # content = preprocess_tikz(content)
+                content = render_tikz_to_svg(content, docs_dir)
                 content = fix_markdown_formatting(content)
                 content = preprocess_math(content)
                 
