@@ -35,15 +35,10 @@ site_name = "notes.michalec.it"
 site_url = "https://notes.michalec.it/"
 copyright = "Copyright &copy; 2026 Martin Michalec"
 use_directory_urls = false
-extra_css = [
-    "https://cdn.jsdelivr.net/npm/@rod2ik/tikzjax@latest/dist/fonts.min.css"
-]
 extra_javascript = [
     "javascripts/mathjax.js",
     "https://unpkg.com/mathjax@3/es5/tex-mml-chtml.js",
     "https://unpkg.com/mermaid@10/dist/mermaid.min.js",
-    "javascripts/tikzjax.config.js",
-    "https://cdn.jsdelivr.net/npm/@rod2ik/tikzjax@latest/dist/tikzjax.min.js"
 ]
 markdown_extensions = [
     "tables",
